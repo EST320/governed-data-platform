@@ -127,6 +127,22 @@ def checks(staged_num_rows: int | None = None, quarantine_rate: float | None = N
               "SELECT count(*) FROM dim_filing WHERE amendment_not_loaded",
               "dim_filing", "amendment_not_loaded"),
 
+        # --- FX rates -------------------------------------------------------------
+        Check("fx_rate_positive", "error", "Every FX rate is positive",
+              "SELECT count(*) FROM fx_rate_daily WHERE eur_rate <= 0",
+              "fx_rate_daily", "eur_rate"),
+        Check("fx_rate_unique", "error", "One rate per currency per day",
+              """SELECT coalesce(sum(n - 1), 0) FROM (SELECT count(*) AS n FROM fx_rate_daily
+                      GROUP BY date, currency HAVING count(*) > 1)""",
+              "fx_rate_daily"),
+        Check("fx_coverage", "warn",
+              "Facts in a three-letter currency other than USD that cannot be converted",
+              """SELECT count(*) FROM v_facts_current f
+                 WHERE regexp_matches(f.uom, '^[A-Z]{3}$') AND f.uom <> 'USD'
+                   AND NOT EXISTS (SELECT 1 FROM fx_usd_daily x
+                                   WHERE x.currency = f.uom AND x.date <= f.ddate)""",
+              "fx_usd_daily"),
+
         # --- domain: the balance sheet must balance -------------------------------
         Check("balance_sheet_balances", "warn",
               "Assets = LiabilitiesAndStockholdersEquity for the same filing and date (tolerance 1 unit)",

@@ -44,6 +44,15 @@ surrogate key.
 One row per day between the earliest and latest date referenced;
 `is_quarter_end` flag.
 
+### fx_rate_daily, fx_usd_daily, v_facts_current_usd
+
+`fx_rate_daily`: ECB reference rates, units of `currency` per 1 EUR, one row per
+day and currency. `fx_usd_daily`: USD per one unit of each currency, derived
+through EUR. `v_facts_current_usd`: `v_facts_current` for monetary facts with
+`value_usd`; non-USD values use the latest rate on or before the fact date
+(ASOF join) and report it in `fx_date`. Flows are converted at the period-end
+rate, not the period average.
+
 ### facts_as_of(ts) and v_facts_current
 
 For each fact identity (`cik, tag, date, qtrs, uom, segments, coreg`), the value

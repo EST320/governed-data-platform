@@ -87,6 +87,16 @@ COLUMN_LINEAGE: dict[str, dict[str, list[tuple[str, str]]]] = {
         "value": [("staging.num", "value")],
         "known_at": [("staging.sub", "accepted")],
     },
+    "fx_rate_daily": {
+        "date": [("staging.fx_rates", "date")],
+        "currency": [("staging.fx_rates", "currency")],
+        "eur_rate": [("staging.fx_rates", "eur_rate")],
+    },
+    "fx_usd_daily": {
+        "date": [("staging.fx_rates", "date")],
+        "currency": [("staging.fx_rates", "currency")],
+        "usd_per_unit": [("staging.fx_rates", "eur_rate")],
+    },
 }
 
 
@@ -106,6 +116,14 @@ def _register_staging(con: duckdb.DuckDBPyConnection, data_dir: Path) -> None:
         raise FileNotFoundError(f"{versions} missing; run the amendments step first")
     con.execute(f"CREATE OR REPLACE TEMP VIEW stg_filing_versions AS "
                 f"SELECT * FROM read_parquet('{_parquet(versions)}')")
+
+    fx = staging / "fx_rates"
+    if fx.exists() and any(fx.rglob("*.parquet")):
+        con.execute(f"CREATE OR REPLACE TEMP VIEW stg_fx_rates AS "
+                    f"SELECT date, currency, eur_rate FROM read_parquet('{_parquet(fx)}', hive_partitioning = true)")
+    else:  # FX is optional: without it the USD view is simply limited to USD facts
+        con.execute("CREATE OR REPLACE TEMP TABLE stg_fx_rates "
+                    "(date DATE, currency VARCHAR, eur_rate DECIMAL(18,6))")
 
 
 SCHEMA_SQL = r"""
@@ -224,6 +242,32 @@ WHERE rn = 1;
 
 CREATE VIEW v_facts_current AS
 SELECT * FROM facts_as_of(TIMESTAMP '9999-12-31 00:00:00');
+
+-- ECB reference rates: units of `currency` per 1 EUR.
+CREATE TABLE fx_rate_daily AS
+SELECT date::DATE AS date, currency, eur_rate::DECIMAL(18,6) AS eur_rate FROM stg_fx_rates;
+
+-- USD per one unit of each currency, derived through EUR (the ECB's base).
+CREATE TABLE fx_usd_daily AS
+SELECT r.date, r.currency, (u.eur_rate::DOUBLE / r.eur_rate::DOUBLE)::DECIMAL(24,12) AS usd_per_unit
+FROM fx_rate_daily r
+JOIN fx_rate_daily u ON u.date = r.date AND u.currency = 'USD'
+WHERE r.currency <> 'USD'
+UNION ALL
+SELECT date, 'EUR', eur_rate::DECIMAL(24,12) FROM fx_rate_daily WHERE currency = 'USD';
+
+-- Monetary facts in USD. Non-USD values use the latest rate on or before the
+-- fact date (ASOF join), because there is no fixing on weekends and holidays.
+-- Simplification: flows (qtrs > 0) are converted at the period-end rate, not
+-- at the period's average rate.
+CREATE VIEW v_facts_current_usd AS
+SELECT f.*,
+       CASE WHEN f.uom = 'USD' THEN f.value
+            ELSE round(f.value * fx.usd_per_unit, 4) END AS value_usd,
+       CASE WHEN f.uom = 'USD' THEN NULL ELSE fx.date END AS fx_date
+FROM v_facts_current f
+ASOF LEFT JOIN fx_usd_daily fx ON fx.currency = f.uom AND f.ddate >= fx.date
+WHERE f.uom = 'USD' OR fx.usd_per_unit IS NOT NULL;
 """
 
 
