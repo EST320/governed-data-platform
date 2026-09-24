@@ -36,3 +36,16 @@ def warehouse_dir(spark, tmp_path_factory):
     resolve_amendments(spark, data_dir)
     publish(data_dir, lambda _: None)
     return data_dir
+
+
+@pytest.fixture(scope="session")
+def pipeline_dir(spark, tmp_path_factory):
+    """Run the whole pipeline once on the fixture dataset; tests copy what they mutate."""
+    from src.lineage.openlineage import Emitter
+    from src.pipeline import run
+    from tests.pipeline_fixtures import QUARTERS, land_fixture
+
+    data_dir = tmp_path_factory.mktemp("pipeline")
+    land_fixture(data_dir)
+    run(data_dir, list(QUARTERS), emitter=Emitter(data_dir, url=""), spark=spark)
+    return data_dir

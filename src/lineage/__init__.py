@@ -1,0 +1,1 @@
+"""OpenLineage event emission."""
