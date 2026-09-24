@@ -109,20 +109,39 @@ being restated as a comparative in the following year's report.
 
 ## Quality gate
 
-Each check is a SQL query that counts offending rows. `error` checks block
-publication; `warn` checks are recorded and reported.
+Each check is a SQL query that counts offending rows; all 19 are in
+`src/quality/checks.py`. The severity follows one rule:
 
-| Check | Severity |
-|---|---|
-| fact grain unique; every fact resolves to a company version, a tag and a date; no NULL values | error |
-| fact rows reconcile exactly to staged rows | error |
-| SCD2: one current version per company; intervals valid and contiguous | error |
-| one latest version per filing family | error |
-| every warehouse column has declared lineage | error |
-| quarantine rate below 5% (error) / 1% (warn) | error / warn |
-| balance sheet balances: Assets = Liabilities + Equity | warn |
-| FX rates positive and unique per day and currency | error |
-| facts whose tag has no definition; amendments referenced but not loaded; non-USD facts without a rate | warn |
+- **error** when the warehouse itself would be wrong: joins that do not
+  resolve, rows lost or duplicated, broken version history. Publishing would
+  put numbers in front of users that the platform cannot stand behind, so the
+  build is rejected and the previous warehouse stays live.
+- **warn** when the warehouse is correct but the source data has a known,
+  real-world gap. Real filings do contain undefined custom tags and rounding
+  differences; blocking on them would stop every build. They are recorded in
+  `quality_results` and reported instead.
+
+| Severity | Check | Fails when |
+|---|---|---|
+| error | `fact_grain_unique` | two fact rows share filing, tag, date, period length, unit and dimension |
+| error | `fact_reconciles_to_staging` | fact row count differs from staged row count |
+| error | `fact_filer_resolved` | a fact has no company version valid at its filing time |
+| error | `fact_tag_resolved` | a fact has no tag row |
+| error | `fact_date_in_dim` | a fact date is missing from `dim_date` |
+| error | `fact_value_not_null` | a fact has no value |
+| error | `filer_one_current_version` | a company has zero or several current versions |
+| error | `filer_intervals_valid` | a version ends before it starts |
+| error | `filer_intervals_contiguous` | versions of a company leave a gap or overlap |
+| error | `filing_one_latest_per_family` | a filing family has zero or several latest versions |
+| error | `fx_rate_positive` | an FX rate is zero or negative |
+| error | `fx_rate_unique` | a currency has two rates on the same day |
+| error | `lineage_declared_for_every_column` | a warehouse column has no declared source |
+| error | `quarantine_rate_below_5pct` | 5% or more of raw fact rows were quarantined |
+| warn | `quarantine_rate_below_1pct` | 1% or more of raw fact rows were quarantined |
+| warn | `balance_sheet_balances` | Assets and LiabilitiesAndStockholdersEquity differ by more than 1 unit for the same filing and date |
+| warn | `fact_tag_described` | a fact uses a tag that is not defined in the tag table |
+| warn | `filing_amendment_not_loaded` | the SEC marks a filing as amended, but the amendment is not loaded |
+| warn | `fx_coverage` | a fact in a non-USD currency has no rate on or before its date |
 
 ## Lineage
 
