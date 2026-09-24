@@ -8,9 +8,25 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
       - run: pytest -q
+
+  dags:
+    # Airflow is installed only here: it is large and pins many packages, so it
+    # stays out of requirements.txt. This job checks that the DAGs parse and are
+    # wired as intended.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: >
+          pip install "apache-airflow==3.1.8" requests
+          --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-3.1.8/constraints-3.12.txt"
+      - run: pip install pytest
+      - run: pytest -q tests/test_orchestration.py
