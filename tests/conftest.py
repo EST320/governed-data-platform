@@ -18,3 +18,21 @@ def spark():
     session = get_spark("tests")
     yield session
     session.stop()
+
+
+@pytest.fixture(scope="session")
+def warehouse_dir(spark, tmp_path_factory):
+    """Stage the fixture dataset and publish a warehouse, once per test run.
+    Tests that modify anything work on a copy."""
+    from src.transform.amendments import resolve_amendments
+    from src.transform.edgar_staging import stage_quarter
+    from src.warehouse.build import publish
+    from tests.pipeline_fixtures import QUARTERS, land_fixture
+
+    data_dir = tmp_path_factory.mktemp("warehouse")
+    land_fixture(data_dir)
+    for year, quarter in QUARTERS:
+        stage_quarter(spark, data_dir, year, quarter)
+    resolve_amendments(spark, data_dir)
+    publish(data_dir, lambda _: None)
+    return data_dir
