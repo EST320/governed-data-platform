@@ -6,7 +6,7 @@ An end-to-end data platform on public regulatory filing data, built around
 automated data quality gates and column-level lineage — the traceability
 pattern that regulated reporting requires.
 
-**Status:** ingestion layer implemented and tested. Transformation layer in progress.
+**Status:** ingestion and transformation layers implemented and tested. Warehouse layer next.
 
 ---
 
@@ -33,7 +33,7 @@ the U.S. Securities and Exchange Commission. No API key, no registration.
 | `num.txt` | Numeric facts per filing, per tag, per period | Fact table |
 | `tag.txt` | XBRL taxonomy tags and definitions | Type 2 dimension |
 
-Twelve quarters is roughly 60–100 million fact rows: large enough that Spark is
+Twelve quarters is tens of millions of fact rows: large enough that Spark is
 the tool rather than the decoration, and dirty enough — amended filings,
 encoding inconsistencies, duplicate submissions — that the quality layer has
 real work to do.
@@ -71,7 +71,7 @@ than a modelling preference.
 | Layer | Choice | Status |
 |---|---|---|
 | Ingestion | Python, requests, pandas → Parquet | Done |
-| Processing | PySpark (local mode) | In progress |
+| Processing | PySpark (local mode) | Done |
 | Warehouse | DuckDB | Planned |
 | Quality | Great Expectations | Planned |
 | Lineage | OpenLineage + Marquez | Planned |
@@ -90,12 +90,24 @@ pip install -r requirements.txt
 # SEC asks automated clients to identify themselves
 export SEC_USER_AGENT="Your Name you@example.com"   # Windows: $env:SEC_USER_AGENT="..."
 
-python -m src.ingest.edgar --year 2025 --quarter 4
+python -m src.ingest.edgar --year 2025 --quarter 4          # download + raw landing
+python -m src.transform.edgar_staging --year 2025 --quarter 4  # typing, cleaning, quarantine
+python -m src.transform.amendments                            # link amended filings
 pytest
 ```
 
-Output lands under `data/raw/<table>/year=YYYY/quarter=Q/`. The `data/`
-directory is git-ignored.
+The transform layer runs PySpark in local mode and needs Java 17 or later.
+On Windows, run it inside WSL: Spark's local file writes on native Windows
+need extra Hadoop binaries.
+
+| Layer | Path | Contents |
+|---|---|---|
+| raw | `data/raw/<table>/year=YYYY/quarter=Q/` | source files as landed, every column a string |
+| staging | `data/staging/<table>/year=YYYY/quarter=Q/` | typed, trimmed, one row per natural key |
+| quarantine | `data/quarantine/<table>/year=YYYY/quarter=Q/` | rejected rows, raw values plus `_reject_reason` |
+| staging | `data/staging/filing_versions/` | every filing linked to its earlier and later versions |
+
+The `data/` directory is git-ignored.
 
 ## Design decisions
 
@@ -111,6 +123,30 @@ neighbouring quarters.
 
 **Downloads are atomic.** Archives are written to a `.part` file and renamed
 only when complete, so an interrupted download never looks like a finished one.
+
+**Bad values go to quarantine, never to NULL.** Parsing uses `try_cast` and
+`try_to_timestamp`, and a value that is present in the source but cannot be
+parsed sends the whole row to quarantine with a reason such as
+`unparseable_value` or `orphan_fact`, raw values intact. Turning it into NULL
+would make a data problem look like a missing value.
+
+**Every run proves it lost nothing.** Staging checks
+`input = staged + quarantined + duplicates_dropped`, counted from the files
+actually written, and fails the run if the equation does not hold. This check
+caught a real bug during development: a cached DataFrame from a previous run
+was being reused, and the run reported one quarantined row that was not in the
+source any more.
+
+**Duplicates that disagree are not resolved by guessing.** Identical rows on
+the natural key collapse to one. Rows with the same key but different content
+all go to quarantine as `conflicting_duplicate`; picking one would be a
+silent decision about which number is true.
+
+**Amendments are versions, not overwrites.** A 10-K/A does not replace the
+original 10-K. Filings are grouped by company, report type and period, ordered
+by acceptance time, and each version gets `valid_from` / `valid_to`. The latest
+numbers and the numbers as known on a given date are two filters on the same
+table, and history is never rewritten.
 
 **DuckDB rather than Postgres or a cloud warehouse.** The project has to be
 reproducible by someone with five minutes and no cloud account. DuckDB is a
@@ -128,7 +164,7 @@ report depends on a source. Column-level tells you which field in which source
 
 - [x] Ingestion: quarterly archive download, retry, atomic write, idempotent raw landing
 - [x] Unit tests and CI
-- [ ] Transformation: PySpark typing, cleaning, amended-filing handling
+- [x] Transformation: PySpark typing, cleaning, amended-filing handling
 - [ ] Warehouse: DuckDB star schema with SCD2 `dim_filer`
 - [ ] Quality: Great Expectations suites wired as blocking gates
 - [ ] Lineage: OpenLineage emission to Marquez

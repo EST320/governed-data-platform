@@ -29,7 +29,40 @@ Business key: `tag` + `version`.
 
 Standard date dimension with fiscal quarter and fiscal year flags.
 
-## Open questions
+## Staging tables (implemented)
 
-- Amended filings (`form` = 10-K/A, 10-Q/A): keep both and flag, or supersede?
-- Duplicate facts across filings for the same period: which one is authoritative?
+### staging.sub / staging.num / staging.tag
+
+Typed copies of the raw tables, one row per natural key, partitioned by
+`year` / `quarter`, with lineage columns `_source_file`, `_ingested_at`,
+`_staged_at`. `staging.sub` adds `is_amendment` and `base_form`
+(`10-K/A` -> `10-K`).
+
+| Table | Natural key |
+|---|---|
+| sub | `adsh` |
+| num | `adsh, tag, version, ddate, qtrs, uom, segments, coreg` |
+| tag | `tag, version` |
+
+### staging.filing_versions
+
+One row per filing. A *family* is all filings with the same
+`cik, base_form, period`; versions are ordered by `accepted`.
+
+| Column | Meaning |
+|---|---|
+| `family_id` | hash of the family key |
+| `version_no`, `n_versions`, `is_latest` | position in the family |
+| `supersedes_adsh`, `superseded_by_adsh` | previous / next version |
+| `valid_from`, `valid_to` | acceptance time of this and of the next version; `valid_to` NULL = current |
+| `original_not_loaded` | family starts with an amendment: the original is outside the loaded quarters |
+| `amendment_not_loaded` | SEC's `prevrpt` says the filing was amended, but no later version is loaded |
+| `duplicate_original` | more than one non-amended filing for the same period |
+
+## Decisions
+
+- **Amended filings:** keep every version and link them; do not overwrite.
+  Reports choose `is_latest` or an as-of date through `valid_from` / `valid_to`.
+- **Same fact reported in several filings** (e.g. prior-year comparatives in a
+  later 10-K): kept per filing; the fact table resolves which one applies
+  through the filing's version interval. To be implemented in the warehouse layer.
