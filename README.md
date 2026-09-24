@@ -4,9 +4,10 @@
 
 An end-to-end data platform on SEC financial statement data: ingestion, Spark
 transformation, a DuckDB star schema with point-in-time queries, a blocking
-quality gate, and OpenLineage events with column-level lineage.
+quality gate, OpenLineage events with column-level lineage, an incrementally
+loaded FX source, and Airflow DAGs with retries and deadline alerts.
 
-**Status:** ingestion, transformation, warehouse, quality gate and lineage implemented and tested. Orchestration next.
+**Status:** all roadmap items implemented and tested.
 
 ---
 
@@ -38,6 +39,10 @@ Twelve quarters is tens of millions of fact rows, and the data is dirty in
 realistic ways: amended filings, the same figure reported in several filings,
 malformed values, custom tags without definitions.
 
+**ECB euro reference rates**: daily exchange rates from the European Central
+Bank's data API, loaded incrementally. Some filers report in EUR, JPY, GBP and
+other currencies; the rates let the warehouse express those facts in USD.
+
 ## Architecture
 
 ```mermaid
@@ -51,6 +56,8 @@ flowchart LR
     W --> G{quality<br/>gate}
     G -->|pass| P[(DuckDB<br/>live)]
     G -->|fail| F[(failed build<br/>kept for inspection)]
+    X[ECB daily<br/>FX rates] -->|incremental<br/>upsert| R[(fx_rates)]
+    R --> W
     B & C & W & G -.OpenLineage.-> L[events.jsonl /<br/>Marquez]
 ```
 
@@ -62,6 +69,7 @@ flowchart LR
 | staging | `data/staging/<table>/year=YYYY/quarter=Q/` | typed, trimmed, one row per natural key |
 | quarantine | `data/quarantine/<table>/year=YYYY/quarter=Q/` | rejected rows, raw values plus `_reject_reason` |
 | filing versions | `data/staging/filing_versions/` | every filing linked to its earlier and later versions |
+| fx rates | `data/staging/fx_rates/year=YYYY/` | ECB rates, upserted incrementally; watermark in `data/state/fx_watermark.json` |
 | warehouse | `data/warehouse/edgar.duckdb` | star schema, published only after the quality gate |
 | quality log | `data/warehouse/quality_log.jsonl` | every check of every run, including rejected builds |
 | lineage | `data/lineage/events.jsonl` | OpenLineage events for every step |
@@ -77,6 +85,7 @@ Kimball star schema in DuckDB. Full column list in [docs/data_model.md](docs/dat
 | `dim_filing` | filing | version chain: `version_no`, `is_latest`, `valid_from`, `valid_to` |
 | `dim_tag` | tag × taxonomy version | Type 1; tags used but never described get their own flagged row |
 | `dim_date` | day | quarter-end flag |
+| `fx_rate_daily`, `fx_usd_daily` | day × currency | ECB rates per EUR, and derived USD per unit |
 
 **Point-in-time queries**
 
@@ -86,6 +95,11 @@ SELECT * FROM facts_as_of(TIMESTAMP '2024-03-01') WHERE tag = 'Revenues';
 
 -- Latest known values
 SELECT * FROM v_facts_current WHERE cik = 320193;
+```
+
+```sql
+-- Monetary facts in USD; weekend and holiday dates use the last fixing before them
+SELECT cik, tag, ddate, uom, value, value_usd, fx_date FROM v_facts_current_usd WHERE uom <> 'USD';
 ```
 
 For every fact (company, concept, period, unit, dimension), `facts_as_of(ts)`
@@ -107,7 +121,8 @@ publication; `warn` checks are recorded and reported.
 | every warehouse column has declared lineage | error |
 | quarantine rate below 5% (error) / 1% (warn) | error / warn |
 | balance sheet balances: Assets = Liabilities + Equity | warn |
-| facts whose tag has no definition; amendments referenced but not loaded | warn |
+| FX rates positive and unique per day and currency | error |
+| facts whose tag has no definition; amendments referenced but not loaded; non-USD facts without a rate | warn |
 
 ## Lineage
 
@@ -123,6 +138,55 @@ export OPENLINEAGE_URL=http://localhost:5000   # a local Marquez
 
 If the backend is unreachable the pipeline continues and logs a warning.
 
+## Incremental load (FX)
+
+EDGAR arrives as whole quarterly archives, so a quarter is simply replaced.
+Rates arrive one day at a time, so `src/ingest/fx.py` loads them incrementally:
+
+- **Watermark**: the latest date loaded, stored in `data/state/fx_watermark.json`.
+  Each run asks the ECB only for `watermark - 7 days` to today.
+- **Lookback**: the 7-day overlap re-reads recent days, so a late publication or
+  a corrected rate is picked up instead of missed.
+- **Upsert** on (date, currency): inserted, updated and unchanged rows are
+  counted separately. Running twice gives the same result as running once.
+- **Only touched partitions are rewritten**, each through a temporary file and
+  an atomic rename.
+- **The watermark moves only after every write succeeded**, and never
+  backwards. A failed or rejected batch leaves data and watermark unchanged, so
+  the next run retries the same window.
+
+## Orchestration (Airflow)
+
+`dags/edgar_pipeline.py` defines two DAGs for Airflow 3.1+. Both call the same
+step functions as the command line (`src/pipeline.py`).
+
+| DAG | Schedule | Tasks |
+|---|---|---|
+| `fx_rates_daily` | weekdays 17:00 Frankfurt, after the ECB fixing | `load_fx_rates` |
+| `edgar_quarterly` | 06:00 UTC on 5 Jan / Apr / Jul / Oct | `previous_quarter` → `ingest` → `stage` → `amendments` → `build_and_publish` |
+
+**Retries.** Exponential backoff everywhere. The SEC download gets 5 retries and
+the ECB load 4, because network failures are usually transient. The quality gate
+gets **none**: a failed check fails again on the same data, and retrying only
+delays the alert.
+
+**Timing.** Airflow 3 removed the old task-level SLA. Two mechanisms replace it:
+hard limits (`execution_timeout` per task, `dagrun_timeout` per run) turn a hung
+step into a failure; a **DeadlineAlert** fires if a run has not finished within
+its target (30 min for FX, 3 h for EDGAR) after being queued, even while it is
+still running.
+
+**Alerts.** Task failures (after the last retry) and missed deadlines post to a
+Slack- or Discord-compatible webhook set in `ALERT_WEBHOOK_URL`. An alert that
+cannot be delivered is logged, never raised.
+
+**Concurrency.** `max_active_runs=1` on both DAGs: two FX loads must never upsert
+the same partition at once. `catchup=False` because the FX watermark already
+covers missed days.
+
+CI runs the DAG structure tests in a separate job with Airflow installed, so
+Airflow stays out of `requirements.txt`.
+
 ## Quick start
 
 ```bash
@@ -135,13 +199,13 @@ pip install -r requirements.txt
 # SEC asks automated clients to identify themselves
 export SEC_USER_AGENT="Your Name you@example.com"
 
-# everything: download, stage, link amendments, build, gate, publish
-python -m src.pipeline --quarters 2025q3 2025q4 --download
+# everything: download EDGAR, load FX, stage, link amendments, build, gate, publish
+python -m src.pipeline --quarters 2025q3 2025q4 --download --fx
 
 pytest
 ```
 
-Individual steps can also be run on their own: `src.ingest.edgar`,
+Individual steps can also be run on their own: `src.ingest.edgar`, `src.ingest.fx`,
 `src.transform.edgar_staging`, `src.transform.amendments`, `src.warehouse.build`.
 
 Spark needs Java 17 or later. On Windows, use WSL: Spark's local file writes on
@@ -156,8 +220,8 @@ native Windows need extra Hadoop binaries.
 | Warehouse | DuckDB | Done |
 | Quality | SQL checks as a blocking gate | Done |
 | Lineage | OpenLineage (file + HTTP to Marquez) | Done |
-| Orchestration | Apache Airflow | Planned |
-| Runtime | Docker Compose | Planned |
+| Incremental source | ECB data API, watermark + lookback + upsert | Done |
+| Orchestration | Apache Airflow 3.1 | Done |
 
 ## Design decisions
 
@@ -220,8 +284,8 @@ single file, needs no server, and is columnar.
 - [x] Warehouse: DuckDB star schema, SCD2 `dim_filer`, point-in-time queries
 - [x] Quality: blocking gate with recorded results
 - [x] Lineage: OpenLineage events with column-level lineage
-- [ ] Orchestration: Airflow DAG with retries and SLA alerting
-- [ ] Incremental source: daily FX rates, demonstrating incremental load
+- [x] Orchestration: Airflow DAGs with retries, timeouts, deadline alerts and webhook alerting
+- [x] Incremental source: daily FX rates, watermark + lookback + idempotent upsert
 
 ---
 
